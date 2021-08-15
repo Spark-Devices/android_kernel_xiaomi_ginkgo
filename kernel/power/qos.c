@@ -51,6 +51,8 @@
 #include <linux/export.h>
 #include <trace/events/power.h>
 
+#define CPUMASK_ALL (BIT(NR_CPUS) - 1)
+
 /*
  * locking rule: all changes to constraints or notifiers lists
  * or pm_qos_object list and pm_qos_objects need to happen with pm_qos_lock
@@ -266,12 +268,17 @@ static const struct file_operations pm_qos_debug_fops = {
 	.release        = single_release,
 };
 
-static inline int pm_qos_set_value_for_cpus(struct pm_qos_constraints *c,
-		struct cpumask *cpus)
+static inline int pm_qos_set_value_for_cpus(struct pm_qos_request *new_req,
+					    struct pm_qos_constraints *c,
+					    unsigned long *cpus)
 {
-	struct pm_qos_request *req = NULL;
+	s32 qos_val[NR_CPUS] = {
+		[0 ... (NR_CPUS - 1)] = PM_QOS_CPU_DMA_LAT_DEFAULT_VALUE
+	};
+	struct pm_qos_request *req;
+	unsigned long new_req_cpus;
+	bool changed = false;
 	int cpu;
-	s32 qos_val[NR_CPUS] = { [0 ... (NR_CPUS - 1)] = c->default_value };
 
 	/*
 	 * pm_qos_constraints can be from different classes,
@@ -281,30 +288,35 @@ static inline int pm_qos_set_value_for_cpus(struct pm_qos_constraints *c,
 	if (c != pm_qos_array[PM_QOS_CPU_DMA_LATENCY]->constraints)
 		return -EINVAL;
 
-	plist_for_each_entry(req, &c->list, node) {
-		for_each_cpu(cpu, &req->cpus_affine) {
-			switch (c->type) {
-			case PM_QOS_MIN:
-				if (qos_val[cpu] > req->node.prio)
-					qos_val[cpu] = req->node.prio;
-				break;
-			case PM_QOS_MAX:
-				if (req->node.prio > qos_val[cpu])
-					qos_val[cpu] = req->node.prio;
-				break;
-			case PM_QOS_SUM:
-					qos_val[cpu] += req->node.prio;
-				break;
-			default:
-				break;
-			}
+	new_req_cpus = atomic_read(&new_req->cpus_affine);
+	for_each_cpu(cpu, to_cpumask(&new_req_cpus)) {
+		if (c->target_per_cpu[cpu] != new_req->node.prio) {
+			changed = true;
+			break;
 		}
 	}
 
-	for_each_possible_cpu(cpu) {
-		if (c->target_per_cpu[cpu] != qos_val[cpu])
-			cpumask_set_cpu(cpu, cpus);
-		c->target_per_cpu[cpu] = qos_val[cpu];
+	if (!changed)
+		return 0;
+
+	plist_for_each_entry(req, &c->list, node) {
+		unsigned long affected_cpus;
+
+		affected_cpus = atomic_read(&req->cpus_affine) & new_req_cpus;
+		if (!affected_cpus)
+			continue;
+
+		for_each_cpu(cpu, to_cpumask(&affected_cpus)) {
+			if (qos_val[cpu] > req->node.prio)
+				qos_val[cpu] = req->node.prio;
+		}
+	}
+
+	for_each_cpu(cpu, to_cpumask(&new_req_cpus)) {
+		if (c->target_per_cpu[cpu] != qos_val[cpu]) {
+			c->target_per_cpu[cpu] = qos_val[cpu];
+			*cpus |= BIT(cpu);
+		}
 	}
 
 	return 0;
@@ -321,11 +333,12 @@ static inline int pm_qos_set_value_for_cpus(struct pm_qos_constraints *c,
  * This function returns 1 if the aggregated constraint value has changed, 0
  *  otherwise.
  */
-int pm_qos_update_target(struct pm_qos_constraints *c, struct plist_node *node,
+int __always_inline pm_qos_update_target(struct pm_qos_constraints *c, struct plist_node *node,
 			 enum pm_qos_req_action action, int value)
 {
+	struct pm_qos_request *req = container_of(node, typeof(*req), node);
 	int prev_value, curr_value, new_value;
-	struct cpumask cpus;
+	unsigned long cpus = 0;
 	int ret;
 
 	spin_lock(&pm_qos_lock);
@@ -356,9 +369,8 @@ int pm_qos_update_target(struct pm_qos_constraints *c, struct plist_node *node,
 	}
 
 	curr_value = pm_qos_get_value(c);
-	cpumask_clear(&cpus);
 	pm_qos_set_value(c, curr_value);
-	ret = pm_qos_set_value_for_cpus(c, &cpus);
+	ret = pm_qos_set_value_for_cpus(req, c, &cpus);
 
 	spin_unlock(&pm_qos_lock);
 
@@ -369,7 +381,7 @@ int pm_qos_update_target(struct pm_qos_constraints *c, struct plist_node *node,
 	 * to update the new qos restriction for the cores
 	 */
 
-	if (!cpumask_empty(&cpus) ||
+	if (cpus ||
 	   (ret && prev_value != curr_value)) {
 		ret = 1;
 		if (c->notifiers)
@@ -502,7 +514,7 @@ int pm_qos_request_for_cpumask(int pm_qos_class, struct cpumask *mask)
 }
 EXPORT_SYMBOL(pm_qos_request_for_cpumask);
 
-static void __pm_qos_update_request(struct pm_qos_request *req,
+static __always_inline void __pm_qos_update_request(struct pm_qos_request *req,
 			   s32 new_value)
 {
 	trace_pm_qos_update_request(req->pm_qos_class, new_value);
@@ -516,7 +528,6 @@ static void __pm_qos_update_request(struct pm_qos_request *req,
 #ifdef CONFIG_SMP
 static void pm_qos_irq_release(struct kref *ref)
 {
-	unsigned long flags;
 	struct irq_affinity_notify *notify = container_of(ref,
 					struct irq_affinity_notify, kref);
 	struct pm_qos_request *req = container_of(notify,
@@ -524,38 +535,21 @@ static void pm_qos_irq_release(struct kref *ref)
 	struct pm_qos_constraints *c =
 				pm_qos_array[req->pm_qos_class]->constraints;
 
-	spin_lock_irqsave(&pm_qos_lock, flags);
-	cpumask_setall(&req->cpus_affine);
-	spin_unlock_irqrestore(&pm_qos_lock, flags);
-
+	atomic_set(&req->cpus_affine, CPUMASK_ALL);
 	pm_qos_update_target(c, &req->node, PM_QOS_UPDATE_REQ,
 			c->default_value);
 }
 
 static void pm_qos_irq_notify(struct irq_affinity_notify *notify,
-		const cpumask_t *unused_mask)
+		const cpumask_t *mask)
 {
-	unsigned long flags;
 	struct pm_qos_request *req = container_of(notify,
 					struct pm_qos_request, irq_notify);
 	struct pm_qos_constraints *c =
 				pm_qos_array[req->pm_qos_class]->constraints;
-	struct irq_desc *desc = irq_to_desc(req->irq);
-	struct cpumask *new_affinity =
-			irq_data_get_effective_affinity_mask(&desc->irq_data);
-	bool affinity_changed = false;
 
-	spin_lock_irqsave(&pm_qos_lock, flags);
-	if (!cpumask_equal(&req->cpus_affine, new_affinity)) {
-		cpumask_copy(&req->cpus_affine, new_affinity);
-		affinity_changed = true;
-	}
-
-	spin_unlock_irqrestore(&pm_qos_lock, flags);
-
-	if (affinity_changed)
-		pm_qos_update_target(c, &req->node, PM_QOS_UPDATE_REQ,
-				     req->node.prio);
+	atomic_set(&req->cpus_affine, *cpumask_bits(mask));
+	pm_qos_update_target(c, &req->node, PM_QOS_UPDATE_REQ, req->node.prio);
 }
 #endif
 
@@ -585,9 +579,8 @@ void pm_qos_add_request(struct pm_qos_request *req,
 
 	switch (req->type) {
 	case PM_QOS_REQ_AFFINE_CORES:
-		if (cpumask_empty(&req->cpus_affine)) {
+		if (!atomic_cmpxchg_relaxed(&req->cpus_affine, 0, CPUMASK_ALL)) {
 			req->type = PM_QOS_REQ_ALL_CORES;
-			cpumask_setall(&req->cpus_affine);
 			WARN(1, "Affine cores not set for request with affinity flag\n");
 		}
 		break;
@@ -600,24 +593,17 @@ void pm_qos_add_request(struct pm_qos_request *req,
 			if (!desc)
 				return;
 
-			/*
-			 * If the IRQ is not started, the effective affinity
-			 * won't be set. So fallback to the default affinity.
-			 */
-			mask = irq_data_get_effective_affinity_mask(
-						&desc->irq_data);
-			if (cpumask_empty(mask))
-				mask = irq_data_get_affinity_mask(
-						&desc->irq_data);
+			mask = desc->irq_data.common->affinity;
 
-			cpumask_copy(&req->cpus_affine, mask);
+			/* Get the current affinity */
+			atomic_set(&req->cpus_affine, *cpumask_bits(mask));
 			req->irq_notify.irq = req->irq;
 			req->irq_notify.notify = pm_qos_irq_notify;
 			req->irq_notify.release = pm_qos_irq_release;
 
 		} else {
 			req->type = PM_QOS_REQ_ALL_CORES;
-			cpumask_setall(&req->cpus_affine);
+			atomic_set(&req->cpus_affine, CPUMASK_ALL);
 			WARN(1, "IRQ-%d not set for request with affinity flag\n",
 					req->irq);
 		}
@@ -627,7 +613,7 @@ void pm_qos_add_request(struct pm_qos_request *req,
 		WARN(1, "Unknown request type %d\n", req->type);
 		/* fall through */
 	case PM_QOS_REQ_ALL_CORES:
-		cpumask_setall(&req->cpus_affine);
+		atomic_set(&req->cpus_affine, CPUMASK_ALL);
 		break;
 	}
 
@@ -646,7 +632,7 @@ void pm_qos_add_request(struct pm_qos_request *req,
 		if (ret) {
 			WARN(1, "IRQ affinity notify set failed\n");
 			req->type = PM_QOS_REQ_ALL_CORES;
-			cpumask_setall(&req->cpus_affine);
+			atomic_set(&req->cpus_affine, CPUMASK_ALL);
 			pm_qos_update_target(
 				pm_qos_array[pm_qos_class]->constraints,
 				&req->node, PM_QOS_UPDATE_REQ, value);
@@ -666,7 +652,7 @@ EXPORT_SYMBOL_GPL(pm_qos_add_request);
  *
  * Attempts are made to make this code callable on hot code paths.
  */
-void pm_qos_update_request(struct pm_qos_request *req,
+void __always_inline pm_qos_update_request(struct pm_qos_request *req,
 			   s32 new_value)
 {
 	if (!req) /*guard against callers passing in null */
@@ -840,6 +826,9 @@ static ssize_t pm_qos_power_write(struct file *filp, const char __user *buf,
 	s32 value;
 	struct pm_qos_request *req;
 
+	/* Don't let userspace impose restrictions on CPU idle levels */
+	return count;
+
 	if (count == sizeof(s32)) {
 		if (copy_from_user(&value, buf, sizeof(s32)))
 			return -EFAULT;
@@ -865,9 +854,6 @@ static int __init pm_qos_power_init(void)
 	struct dentry *d;
 
 	BUILD_BUG_ON(ARRAY_SIZE(pm_qos_array) != PM_QOS_NUM_CLASSES);
-
-	/* Don't let userspace impose restrictions on CPU idle levels */
-	return 0;
 
 	d = debugfs_create_dir("pm_qos", NULL);
 	if (IS_ERR_OR_NULL(d))
